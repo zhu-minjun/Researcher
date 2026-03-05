@@ -17,6 +17,8 @@
 
 
 ### Update:
+[03/05/2026] We have opensourced the **DeepReviewer-v2** in [Github](https://github.com/ResearAI/DeepReviewer-v2) and the DeepReviewer 2.0 **online platform** is now live. It is free for all scholars. Try it out at [deepscientist.cc](https://deepscientist.cc).
+
 [04/26/2025] We hosted [AI Co-scientist Discussion](https://ai-researcher.net/social-iclr-2025) in ICLR 2025, over 300 people gathered together!
 
 [04/06/2025] We have collected 400 papers related to AI Scientists in our [Awesome-AI-Scientist GitHub repository](https://github.com/ResearAI/Awesome-AI-Scientist). If you're interested in this field, don't miss out!
