@@ -3,8 +3,43 @@ import requests
 import json
 from copy import deepcopy
 
-from transformers import AutoTokenizer
-from vllm import LLM, SamplingParams
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+
+def _auto_device():
+    """Pick the best available device: CUDA > MPS (Apple Silicon) > CPU."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _auto_dtype(device):
+    """Pick a safe dtype for the detected device.
+
+    - CUDA with compute capability >= 8.0 (Ampere/Hopper): bfloat16
+    - CUDA older than Ampere (T4, V100, P100): float16
+    - MPS: float16 (bf16 support is inconsistent)
+    - CPU: float32 (bf16/fp16 are slow or unsupported on most CPUs)
+    """
+    if device == "cuda":
+        major, _ = torch.cuda.get_device_capability()
+        return torch.bfloat16 if major >= 8 else torch.float16
+    if device == "mps":
+        return torch.float16
+    return torch.float32
+
+
+def _auto_attn_implementation(device):
+    """Pick an attention kernel that works on the device.
+
+    SDPA is built into torch >= 2.1 and runs everywhere (CUDA / MPS / CPU).
+    flash_attention_2 is faster on Ampere+ but is opt-in (requires the
+    flash-attn package), so we never auto-select it.
+    """
+    return "sdpa"
 
 # Helper Functions for Best Mode
 # Adapted from the provided Flask app (main.py)
@@ -113,25 +148,44 @@ class DeepReviewer:
     def __init__(self,
                  model_size="14B",
                  custom_model_name=None,
-                 device="cuda",
-                 tensor_parallel_size=1,
-                 gpu_memory_utilization=0.95):
+                 device=None,
+                 torch_dtype=None,
+                 attn_implementation=None,
+                 max_input_length=8192,
+                 device_map="auto",
+                 load_in_4bit=False,
+                 load_in_8bit=False,
+                 verbose=True):
         """
-        Initialize the DeepReviewer.
+        Initialize the DeepReviewer (transformers backend, portable defaults).
+
+        All hardware-sensitive parameters are auto-detected when left as None,
+        so the same call works on an A100, a laptop RTX, a Mac M-series, or CPU.
 
         Args:
-            model_size (str): Size of the default model to use. Options: "14B", "70B", "123B"
-            custom_model_name (str, optional): Custom model name to override default mapping
-            device (str): Device to run the model on. Default is "cuda"
-            tensor_parallel_size (int): Number of GPUs to use for tensor parallelism
-            gpu_memory_utilization (float): Fraction of GPU memory to use
+            model_size (str): "7B" or "14B" (default). On <24 GB VRAM prefer "7B"
+                or pass load_in_4bit=True.
+            custom_model_name (str, optional): HF model id to override the mapping.
+            device (str, optional): "cuda" | "mps" | "cpu". Auto-detected if None.
+            torch_dtype (torch.dtype, optional): Auto-selected per device if None
+                (bf16 on Ampere+, fp16 on older CUDA/MPS, fp32 on CPU).
+            attn_implementation (str, optional): "sdpa" (default, portable),
+                "flash_attention_2" (faster but requires flash-attn), or "eager".
+                Falls back to "sdpa" if the chosen kernel is unavailable.
+            max_input_length (int): Prompt truncation length. 8192 is a safe
+                portable default. Raise it on big GPUs if your papers need it.
+            device_map (str | dict | None): HF accelerate device map. "auto"
+                offloads to CPU/disk if the GPU is too small.
+            load_in_4bit (bool): 4-bit NF4 quantization via bitsandbytes.
+                Lets 14B run on ~10 GB VRAM. Ignored on non-CUDA devices.
+            load_in_8bit (bool): 8-bit quantization via bitsandbytes.
+            verbose (bool): Print the auto-detected configuration on load.
         """
         model_mapping = {
             "14B": "WestlakeNLP/DeepReviewer-14B",
             "7B": "WestlakeNLP/DeepReviewer-7B",
         }
 
-        # Determine model name
         if custom_model_name:
             model_name = custom_model_name
         else:
@@ -139,23 +193,118 @@ class DeepReviewer:
                 raise ValueError(f"Invalid model size. Choose from {list(model_mapping.keys())}")
             model_name = model_mapping[model_size]
 
-        # Load tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        # --- Auto-detect hardware ---
+        if device is None:
+            device = _auto_device()
+        if torch_dtype is None:
+            torch_dtype = _auto_dtype(device)
+        if attn_implementation is None:
+            attn_implementation = _auto_attn_implementation(device)
 
-        # Load model using vLLM
-        self.model = LLM(
-            model=model_name,
-            tensor_parallel_size=tensor_parallel_size,
-            max_model_len=90000,
-            gpu_memory_utilization=gpu_memory_utilization
-        )
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+        self.tokenizer.padding_side = "left"
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # Store model configuration for reference
+        load_kwargs = {
+            "torch_dtype": torch_dtype,
+            "low_cpu_mem_usage": True,
+        }
+
+        # Quantization is CUDA-only (bitsandbytes)
+        quantization = None
+        if (load_in_4bit or load_in_8bit) and device == "cuda":
+            try:
+                from transformers import BitsAndBytesConfig
+                quantization = BitsAndBytesConfig(
+                    load_in_4bit=load_in_4bit,
+                    load_in_8bit=load_in_8bit,
+                    bnb_4bit_compute_dtype=torch_dtype if load_in_4bit else None,
+                    bnb_4bit_quant_type="nf4" if load_in_4bit else None,
+                    bnb_4bit_use_double_quant=bool(load_in_4bit),
+                )
+                load_kwargs["quantization_config"] = quantization
+            except ImportError:
+                print("[DeepReviewer] bitsandbytes not installed; ignoring quantization flags.")
+
+        # device_map only makes sense with accelerate; fall back to explicit .to(device)
+        if device_map is not None:
+            load_kwargs["device_map"] = device_map
+
+        def _load(attn):
+            return AutoModelForCausalLM.from_pretrained(
+                model_name, attn_implementation=attn, **load_kwargs
+            )
+
+        try:
+            self.model = _load(attn_implementation)
+        except (ImportError, ValueError, RuntimeError) as e:
+            if attn_implementation != "sdpa":
+                print(f"[DeepReviewer] attn='{attn_implementation}' unavailable ({type(e).__name__}); "
+                      "falling back to 'sdpa'.")
+                self.model = _load("sdpa")
+                attn_implementation = "sdpa"
+            else:
+                raise
+
+        if device_map is None and quantization is None:
+            self.model = self.model.to(device)
+        self.model.eval()
+
+        self.device = self.model.device
+        self.max_input_length = max_input_length
         self.model_name = model_name
         self.model_config = {
-            "tensor_parallel_size": tensor_parallel_size,
-            "gpu_memory_utilization": gpu_memory_utilization
+            "device": str(self.device),
+            "torch_dtype": str(torch_dtype),
+            "attn_implementation": getattr(self.model.config, "_attn_implementation", attn_implementation),
+            "max_input_length": max_input_length,
+            "device_map": device_map,
+            "quantization": "4bit" if load_in_4bit else ("8bit" if load_in_8bit else "none"),
         }
+
+        if verbose:
+            print(f"[DeepReviewer] Loaded {model_name}")
+            for k, v in self.model_config.items():
+                print(f"  - {k}: {v}")
+
+    @torch.inference_mode()
+    def _generate(self, prompts, max_new_tokens=8192, temperature=0.4, top_p=0.95):
+        """
+        Batched text generation using transformers (drop-in replacement for vLLM).
+
+        Args:
+            prompts (list[str]): List of already chat-templated prompts.
+            max_new_tokens (int): Max tokens to generate per prompt.
+            temperature (float): Sampling temperature.
+            top_p (float): Nucleus sampling top-p.
+
+        Returns:
+            list[str]: Decoded completions (input stripped).
+        """
+        inputs = self.tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.max_input_length,
+        ).to(self.device)
+
+        gen_kwargs = dict(
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+            use_cache=True,
+            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+        )
+
+        outputs = self.model.generate(**inputs, **gen_kwargs)
+        # Strip the echoed input tokens
+        input_len = inputs["input_ids"].shape[1]
+        generated = outputs[:, input_len:]
+        return self.tokenizer.batch_decode(generated, skip_special_tokens=True)
 
     def _generate_system_prompt(self, mode="Standard Mode", reviewer_num=4):
         """
@@ -181,7 +330,8 @@ class DeepReviewer:
         else:
             return "You are an expert academic reviewer tasked with providing a thorough and balanced evaluation of research papers."
 
-    def evaluate(self, paper_context, mode="Standard Mode", reviewer_num=4, max_tokens=35000):
+    def evaluate(self, paper_context, mode="Standard Mode", reviewer_num=4,
+                 max_tokens=8192, batch_size=1, temperature=0.4, top_p=0.95):
         """
         Generate a peer review for the given academic paper.
 
@@ -204,11 +354,10 @@ class DeepReviewer:
             raise TypeError("paper_context must be a string or a list of strings.")
 
         generated_reviews_batch = []
-        
-        batch_size = 10 
+
         for i in range(0, len(paper_contexts), batch_size):
             current_batch_contexts = paper_contexts[i:i + batch_size]
-            
+
             if mode != "Best Mode":
                 prompts = []
                 for single_paper_context in current_batch_contexts:
@@ -221,16 +370,15 @@ class DeepReviewer:
                     )
                     prompts.append(input_text)
 
-                sampling_params = SamplingParams(temperature=0.4, top_p=0.95, max_tokens=max_tokens)
-                outputs = self.model.generate(prompts, sampling_params)
-
-                for output in outputs:
-                    generated_text = output.outputs[0].text
-                    review = self._parse_review(generated_text)
-                    generated_reviews_batch.append(review)
-            else: # Best Mode - Process one by one from the batch due to sequential nature of API calls
+                generated_texts = self._generate(
+                    prompts, max_new_tokens=max_tokens,
+                    temperature=temperature, top_p=top_p,
+                )
+                for generated_text in generated_texts:
+                    generated_reviews_batch.append(self._parse_review(generated_text))
+            else:  # Best Mode - sequential per paper (two LLM calls + external retrieval)
                 for single_paper_context in current_batch_contexts:
-                    # --- First LLM Call (Best Mode) ---
+                    # --- First LLM Call ---
                     messages_step1 = [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": single_paper_context}
@@ -238,43 +386,35 @@ class DeepReviewer:
                     input_text_step1 = self.tokenizer.apply_chat_template(
                         messages_step1, tokenize=False, add_generation_prompt=True
                     )
-                    sampling_params_step1 = SamplingParams(temperature=0.4, top_p=0.95, max_tokens=max_tokens)
-                    
-                    outputs_step1 = self.model.generate([input_text_step1], sampling_params_step1)
-                    generated_text_step1 = outputs_step1[0].outputs[0].text
+                    generated_text_step1 = self._generate(
+                        [input_text_step1], max_new_tokens=max_tokens,
+                        temperature=temperature, top_p=top_p,
+                    )[0]
 
-                    # --- Extract Questions (Best Mode) ---
                     questions = extract_questions_from_content(generated_text_step1)
-
                     if not questions:
-                        # Fallback: parse the step 1 output as the final review.
-                        review = self._parse_review(generated_text_step1)
-                        generated_reviews_batch.append(review)
-                        continue # Next paper in batch
+                        generated_reviews_batch.append(self._parse_review(generated_text_step1))
+                        continue
 
-                    # --- Retrieve Information from OpenScholar (Best Mode) ---
                     retrieved_data = retrieve_information(questions)
-
-                    # --- Format Q&A Text (Best Mode) ---
                     qa_text = get_question_and_answer_text(questions, retrieved_data)
 
-                    # --- Second LLM Call (Best Mode) ---
+                    # --- Second LLM Call ---
                     messages_step2 = [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": single_paper_context},
-                        {"role": "assistant", "content": generated_text_step1}, 
-                        {"role": "user", "content": qa_text} 
+                        {"role": "assistant", "content": generated_text_step1},
+                        {"role": "user", "content": qa_text}
                     ]
                     input_text_step2 = self.tokenizer.apply_chat_template(
                         messages_step2, tokenize=False, add_generation_prompt=True
                     )
-                    sampling_params_step2 = SamplingParams(temperature=0.4, top_p=0.95, max_tokens=max_tokens)
-                    
-                    outputs_step2 = self.model.generate([input_text_step2], sampling_params_step2)
-                    generated_text_step2 = outputs_step2[0].outputs[0].text
-                    
-                    review = self._parse_review(generated_text_step2)
-                    generated_reviews_batch.append(review)
+                    generated_text_step2 = self._generate(
+                        [input_text_step2], max_new_tokens=max_tokens,
+                        temperature=temperature, top_p=top_p,
+                    )[0]
+
+                    generated_reviews_batch.append(self._parse_review(generated_text_step2))
 
         return generated_reviews_batch
 

@@ -1,4 +1,4 @@
-from ai_researcher.utils import get_reviewer_score
+from revisa.utils import get_reviewer_score
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 

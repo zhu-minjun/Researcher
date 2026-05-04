@@ -3,9 +3,9 @@ from typing import Optional, List, Dict
 
 import numpy as np
 import torch
-from ai_researcher.detect.detect_data import DATA_
-from ai_researcher.detect.fast_detect_gpt import get_sampling_discrepancy_analytic
-from ai_researcher.detect.model import load_tokenizer, load_model
+from revisa.detect.detect_data import DATA_
+from revisa.detect.fast_detect_gpt import get_sampling_discrepancy_analytic
+from revisa.detect.model import load_tokenizer, load_model
 from tqdm import tqdm
 
 

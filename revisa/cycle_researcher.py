@@ -1,4 +1,4 @@
-from ai_researcher.utils import get_paper_from_generated_text
+from revisa.utils import get_paper_from_generated_text
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 

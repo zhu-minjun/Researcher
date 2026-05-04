@@ -8,10 +8,10 @@ import os
 import random
 import time
 
-import ai_researcher.detect.custom_datasets
+import revisa.detect.custom_datasets
 import numpy as np
 import torch
-from ai_researcher.detect.model import load_tokenizer, load_model
+from revisa.detect.model import load_tokenizer, load_model
 
 
 def save_data(output_file, args, data):

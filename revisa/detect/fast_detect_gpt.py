@@ -9,9 +9,9 @@ import random
 import numpy as np
 import torch
 import tqdm
-from ai_researcher.detect.data_builder import load_data
-from ai_researcher.detect.metrics import get_roc_metrics, get_precision_recall_metrics
-from ai_researcher.detect.model import load_tokenizer, load_model
+from revisa.detect.data_builder import load_data
+from revisa.detect.metrics import get_roc_metrics, get_precision_recall_metrics
+from revisa.detect.model import load_tokenizer, load_model
 
 
 def get_samples(logits, labels):
